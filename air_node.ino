@@ -1,0 +1,200 @@
+#include <WiFi.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
+#include <GP2Y1010AU0F.h>
+#include "DHT.h"  //adafruit?
+
+#define ESP_NOW_CHANNEL 1  // may need to change
+#define V_LEVELS 4096       // voltage levels or adc resolution
+#define V_REF 3.3           // ESP32C6 reference voltage
+#define V_REF5 5.0
+#define NODEID 0               // water node
+#define NODELOCATION "Guelph"  // max character = 10
+
+#define TEMP_HUMI_PIN 2
+#define CO_PIN 0
+#define VOC_PIN 5
+#define PM25_PIN 4
+#define PM25_LED_PIN 12
+#define NO2_PIN 3
+#define O3_PIN 1
+
+typedef struct struct_message {  //struct to pass to home node
+  bool node_identifier;
+  char node_location[10];
+  float airtemp;
+  float humidity;
+  float co;
+  float o3;
+  float no2;
+  float voc;
+  float pm25;
+} struct_message;
+struct_message myData;
+
+GP2Y1010AU0F pm25_sensor(PM25_LED_PIN, PM25_PIN);  // Construct dust sensor global object
+DHT temp_humi_sensor(TEMP_HUMI_PIN, DHT11);
+
+esp_now_peer_info_t peerInfo;                                     // variable to store channel info
+uint8_t homenodeMac[6] = { 0x32, 0xAE, 0xA4, 0x07, 0x0D, 0x66 };  // Store home node static MAC address
+
+//Function Definitions
+void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status);  //call back function for ESP-NOW
+void update_pm25();
+void update_voc();
+void update_no2();
+void update_o3();
+void update_co();
+void update_humidity();
+void update_airtemp();
+void printData();
+
+void setup() {
+
+  Serial.begin(115200);
+  myData.node_identifier = NODEID;             // set as water node
+  strcpy(myData.node_location, NODELOCATION);  // set location to send
+
+  WiFi.mode(WIFI_STA);  // set device as wifi station
+  WiFi.disconnect();    // ensure clean start
+
+  if (esp_now_init() != ESP_OK) {  // Initialize ESP-NOW
+    Serial.println("Error initializing ESP-NOW");
+    return;
+  }
+  esp_wifi_set_channel(ESP_NOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+
+  esp_now_register_send_cb(OnDataSent);  // Register callback for send status
+
+  // Automatically set the receiver's MAC to this home node's MAC
+  memcpy(peerInfo.peer_addr, homenodeMac, 6);
+  peerInfo.channel = 0;
+  peerInfo.encrypt = false;
+
+  // Add peer
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+    Serial.println("Failed to add peer");
+    return;
+  }
+
+  pinMode(CO_PIN, INPUT);
+  pinMode(VOC_PIN, INPUT);
+  pinMode(PM25_PIN, INPUT);
+  pinMode(NO2_PIN, INPUT);
+  pinMode(O3_PIN, INPUT);
+  pm25_sensor.begin();
+  temp_humi_sensor.begin();  // initialize the sensor
+}
+
+void loop() {
+
+  update_pm25();
+  update_voc();
+  update_no2();
+  update_o3();
+  update_co();
+  update_humidity();
+  update_airtemp();
+  // printData();
+
+  // Send message via ESP-NOW
+  esp_err_t result = esp_now_send(peerInfo.peer_addr, (uint8_t *)&myData, sizeof(myData));
+
+  if (result == ESP_OK) {
+    Serial.println("Sent with success");
+  } else {
+    Serial.println("Error sending the data");
+  }
+  delay(2000);  // send data every second
+}
+
+void update_pm25() {
+  float raw = analogRead(PM25_PIN);
+  float adc = pm25_sensor.read();
+  float base = 1100;
+  float adjusted_pm25 = (((raw) * (V_REF5 / V_LEVELS)) - (base / V_LEVELS * V_REF5)) * 170;  //Convert to 5V logic to match datasheet
+  myData.pm25 = adjusted_pm25;                                                                   // for mg
+}
+
+void update_voc() {
+  float raw = analogRead(VOC_PIN);
+  float adc = (raw / V_LEVELS) * V_REF;
+  float base = 800;
+  float adjusted_voc = (raw - base) * (500 / (V_LEVELS - base));  //ppm converted to ug
+  myData.voc = adjusted_voc;
+}
+
+void update_no2() {
+  float raw = analogRead(NO2_PIN);
+  float adc = (raw / V_LEVELS) * V_REF;
+  float base = 497;
+  float adjusted_no2 = (raw - base) * (9900 / (V_LEVELS - base)) + 100;  //ppb
+  myData.no2 = adjusted_no2;
+}
+
+void update_o3() {
+  float raw = analogRead(O3_PIN);
+  float adc = (raw / V_LEVELS) * V_REF;
+  float base = 2550;
+  float adjusted_o3 = (11.5 / 10) * (raw - base) * (990 / (V_LEVELS - base)) + 10;
+  myData.o3 = adjusted_o3;
+}
+
+void update_co() {
+  float raw = analogRead(CO_PIN);
+  float adc = (raw / V_LEVELS) * V_REF;
+  float base = 1165;
+  float adjusted_co = (raw - base) * (1980 / (V_LEVELS - base)) + 20;  //ppm
+  myData.co = adc;
+}
+
+void update_humidity() {
+  myData.humidity = temp_humi_sensor.readHumidity();
+}
+
+void update_airtemp() {
+  myData.airtemp = temp_humi_sensor.readTemperature();
+}
+
+void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+  Serial.print("\r\nLast Packet Send Status:\t");
+  Serial.println(status == ESP_NOW_SEND_SUCCESS ? "Delivery Success" : "Delivery Fail");
+}
+
+void printData() {
+  Serial.print("ID, ");
+  Serial.print(myData.node_identifier);
+  Serial.print(", ");
+
+  Serial.print("Location, ");
+  Serial.print(myData.node_location);
+  Serial.print(", ");
+
+  Serial.print("O3, ");
+  Serial.print(myData.o3);
+  Serial.print(", ");
+
+  Serial.print("NO2, ");
+  Serial.print(myData.no2);
+  Serial.print(", ");
+
+  Serial.print("CO, ");
+  Serial.print(myData.co);
+  Serial.print(", ");
+
+  Serial.print("VOC, ");
+  Serial.print(myData.voc);
+  Serial.print(", ");
+
+  Serial.print("PM2.5, ");
+  Serial.print(myData.pm25);
+  Serial.print(", ");
+
+  Serial.print("Air Temperature, ");
+  Serial.print(myData.airtemp);
+  Serial.print(", ");
+
+  Serial.print("Humidity, ");
+  Serial.print(myData.humidity);
+  Serial.println();
+}
